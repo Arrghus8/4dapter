@@ -18,17 +18,20 @@
  *  
  */
 
-#include "SegaController32U4.h"
 #include "Gamepad.h"
 #include "N64_Controller.h"
 
 // ATT: 20 chars max (including NULL at the end) according to Arduino source code.
 // Additionally serial number is used to differentiate arduino projects to have different button maps!
-const char *gp_serial = "4DAPTER";
+const char *gp_serial = "4DAPTER_SATURN";
 
 #define N64MapJoyToMax  true  // 'true' to map value to DInput Max (-128 to +127), set to false to use controller value directly
 #define N64JoyMax       80     // N64 Joystick Maximum Travel Range (0-127, typically between 75-85 on OEM controllers)
 #define N64JoyDeadzone  3      // Deadzone to return 0, minimizes drift
+
+#define SATURN_SELECT_PAUSE 20 // How many microseconds to wait after setting select lines? (2µs is enough according to the Saturn developer's manual)
+                               // 20µs is a "safe" value that seems to work for original Saturn controllers and Retrobit wired controllers
+//#define RETROBIT_WL          // Uncomment to support the Retro Bit 2.4GHz wireless controller (this will increase lag a lot)
 
 N64Controller       n64_controller;
 N64_status_packet   N64Data;
@@ -37,7 +40,7 @@ int8_t LeftY = 0;
 
 #define NES       0
 #define SNES      1
-#define GENESIS   2
+#define SATURN    2
 
 #define BUTTONS   0
 #define AXES      1
@@ -53,34 +56,50 @@ int8_t LeftY = 0;
 void sendLatch();
 void sendClock();
 void sendState();
+void SaturnRead1();
+void SaturnRead2();
+void SaturnRead3();
+void SaturnRead4();
 
-// Controller DB9 pins (looking face-on to the end of the plug):
-// 5 4 3 2 1
-//  9 8 7 6
+/* -------------------------------------------------------------------------
+Saturn controller socket (looking face-on at the front of the socket):
+___________________
+/ 1 2 3 4 5 6 7 8 9 \
+|___________________|
+
+Saturn controller plug (looking face-on at the front of the controller plug):
+___________________
+/ 9 8 7 6 5 4 3 2 1 \
+|___________________|
+
+------------------------------------------------------------------------- */
 //
 // Wire it all up according to the following table:
 //
-// Triple Controller    V1            V2        *** = V1 to V2 Change
-// ------------------------------------------------------------------
-// VCC                  VCC ()        VCC ()
-// GND                  GND ()        GND ()
-// Shared-LATCH         2   (PD1)     2   (PD1)
-// Shared-CLOCK         3   (PD0)     3   (PD0)
-// NES-Data1 (4)        A0  (PF7)     A0  (PF7)
-// NES-DataD4 (5)       N/C           9   (PB5) ***
-// NES-DataD3 (6)       N/C           8   (PB4) ***
-// SNES-Data1 (4)       A1  (PF6)     A1  (PF6)
-// SNES-DataD2 (5)      N/C           RX  (PD2) ***
-// SNES-DataD3 (6)      N/C           TX  (PD3) ***
-// DB9-1                5   (PC6)     5   (PC6)
-// DB9-2                6   (PD7)     6   (PB2)
-// DB9-3                A2  (PF5)     A2  (PF5)
-// DB9-4                A3  (PF4)     A3  (PF4)
-// DB9-5                VCC ()        16  (PB2) ***
-// DB9-6                14  (PB3)     14  (PB3)
-// DB9-7                7   (PE6)     7   (PE6)
-// DB9-8                GND ()        GND ()
-// DB9-9                15  (PB1)     15  (PB1)
+// Contr. pin name     Contr. pin     Arduino Pin
+// ----------------------------------------------
+// VCC                                 VCC ()
+// GND                                 GND ()
+// NES/SNES-LATCH          3           2   (PD1)
+// NES/SNES-CLOCK          2           3   (PD0)
+// NES-DATA                4           5   (PC6)
+// NES-DATAD4              5           9   (PB5)
+// NES-DATAD3              6           8   (PB4)
+// SNES-DATA               4           7   (PE6)
+// SNES-DATAD2             5           TX  (PD2)
+// SNES-DATAD3             6           RX  (PD3)
+// N64-3.3V                1           N/A
+// N64-DATA                2           10  (PB6)
+// N64-GND                 3           GND ()
+// Saturn-VCC              1           VCC ()
+// Saturn-DATA1            2           A2  (PF5)
+// Saturn-DATA0            3           A3  (PF4)
+// Saturn-SELECT0          4           15  (PB1)
+// Saturn-SELECT1          5           14  (PB3)
+// Saturn-TL               6           6   (PD7)
+// Saturn-DATA3            7           A0  (PF7)
+// Saturn-DATA2            8           A1  (PF6)
+// Saturn-GND              9           GND ()
 
 /* Power Pad Number Guide
  * C/O: http://www.neshq.com/hardgen/powerpad.txt
@@ -121,20 +140,17 @@ void sendState();
 +--------------------------------+
 */
 
-// Manage EEPROM by making sure everything has
-// its own index.
-enum EEPROMIndices { GENESIS_EEPROM };
-
 // Set up USB HID gamepads
 Gamepad_ Gamepad[3];
-
-SegaController32U4 controller(GENESIS_EEPROM);
 
 // Controllers
 uint32_t  controllerData[2][2] = {{0,0},{0,0}};
 uint32_t  axisIndicator[32] = {0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-uint16_t  currentState = 0;
 bool      nttActive = false;
+
+// Saturn controller buttons
+uint8_t SaturnButtons[2]     = {0,0};
+uint8_t SaturnButtonsPrev[2] = {0,0};
 
 uint32_t  dataMaskNES[8] =        {0x02,   // A
                                    0x01,   // B
@@ -214,17 +230,27 @@ void setup()
   DDRD  |=  B00000011; // output
   PORTD &= ~B00000011; // low
 
-  // Setup NES / SNES data pins (A0/A1 or PF6/PF7)
-  DDRF  &= ~B11000000; // inputs
-  PORTF |=  B11000000; // enable internal pull-ups
+  // Setup NES / SNES data pins (5/7 or PC6/PE6)
+  DDRC  &= ~B01000000; // 5 to input
+  PORTC |=  B01000000; // 5 enable internal pull-up
+  DDRE  &= ~B01000000; // 7 to input
+  PORTE |=  B01000000; // 7 enable internal pull-up
 
   // Setup NES PowerPad data pins (8/9 or PB4/PB5)
   DDRB  &= ~B00110000; // inputs
   PORTB |=  B00110000; // enable internal pull-ups
 
-  // Setup power pin (DB9 Pin 5) as output high (PB2)
-  DDRB  |= B00000100; // output
-  PORTB |= B00000100; // high
+  // Setup Saturn data pins (A3/A2/A1/A0 or PF4-PF7)
+  DDRF  &= ~B11110000; // inputs
+  PORTF |=  B11110000; // enable internal pull-ups
+
+  // Setup Saturn TL pin (6 or PD7)
+  DDRD  &= ~B10000000; // input
+  PORTD |=  B10000000; // enable internal pull-up
+
+  // Set Saturn Select pins (15/14 or PB1/PB3)
+  PORTB |=  B00001010; // outputs
+  DDRB  |=  B00001010; // high
 
   delay(250);
 }
@@ -233,22 +259,40 @@ void loop()
 { 
   while(true)
   {
-    //8 cycles needed to capture 6-button controllers
-    for(uint8_t i = 0; i < 8; i++)
+    //Saturn controller
+    // Clear button data
+    SaturnButtons[0]=0; SaturnButtons[1]=0;
+
+    // Read all button and axes states
+    SaturnRead3();
+    SaturnRead2();
+    SaturnRead1();
+    SaturnRead4();
+
+    // Invert the readings so a 1 means a pressed button
+    SaturnButtons[0] = ~SaturnButtons[0]; SaturnButtons[1] = ~SaturnButtons[1];
+
+    // Send data to USB if values have changed
+    if (SaturnButtons[0] != SaturnButtonsPrev[0] || SaturnButtons[1] != SaturnButtonsPrev[1] )
     {
-      currentState = controller.updateState();
+      Gamepad[1]._GamepadReport.buttons = SaturnButtons[1] | ((SaturnButtons[0] & 0x80)<<1);
+      
+      if      ((SaturnButtons[0] & DOWN) >> 1)  Gamepad[1]._GamepadReport.Y = 0x7F;
+      else if ((SaturnButtons[0] & UP)       )  Gamepad[1]._GamepadReport.Y = 0x80;
+      else    Gamepad[1]._GamepadReport.Y = 0;
+
+      if      ((SaturnButtons[0] & RIGHT) >> 3)  Gamepad[1]._GamepadReport.X = 0x7F;
+      else if ((SaturnButtons[0] & LEFT ) >> 2)  Gamepad[1]._GamepadReport.X = 0x80;
+      else    Gamepad[1]._GamepadReport.X = 0;
+
+      SaturnButtonsPrev[0] = SaturnButtons[0];
+      SaturnButtonsPrev[1] = SaturnButtons[1];
     }
 
-    currentState = controller.getFinalState();
-    Gamepad[1]._GamepadReport.buttons = currentState >> 4;
-
-    if      (((currentState & SC_BTN_DOWN) >> SC_BIT_SH_DOWN))    Gamepad[1]._GamepadReport.Y = 0x7F;
-    else if (((currentState & SC_BTN_UP) >> SC_BIT_SH_UP))        Gamepad[1]._GamepadReport.Y = 0x80;
-    else                                                          Gamepad[1]._GamepadReport.Y = 0;
-
-    if      (((currentState & SC_BTN_RIGHT) >> SC_BIT_SH_RIGHT))  Gamepad[1]._GamepadReport.X = 0x7F;
-    else if (((currentState & SC_BTN_LEFT) >> SC_BIT_SH_LEFT))    Gamepad[1]._GamepadReport.X = 0x80;
-    else                                                          Gamepad[1]._GamepadReport.X = 0;
+    #ifdef RETROBIT_WL
+      // This delay is needed for the retro bit 2.4GHz wireless controller, making it more or less useless with this adapter
+      delay(17);
+    #endif
 
     for(uint8_t j = 0; j < 1; j++)
     {
@@ -282,7 +326,7 @@ void loop()
         }
 
         // NES Controller
-        if((dataBitCounter < 8) && ((PINF & B10000000) == 0)) //If NES data line is low (indicating a press)
+        if((dataBitCounter < 8) && ((PINC & B01000000) == 0)) //If NES data line is low (indicating a press)
         { 
           if(axisIndicator[dataBitCounter])
           {
@@ -295,7 +339,7 @@ void loop()
         }
 
         // SNES / NTT Controller 
-        if((PINF & B01000000) == 0) //If SNES data line is low (indicating a press)
+        if((PINE & B01000000) == 0) //If SNES data line is low (indicating a press)
         {
           if(dataBitCounter == 13)
           {
@@ -394,6 +438,38 @@ void loop()
 
   sendState();
  }
+}
+
+// Read R, X, Y, Z
+void SaturnRead1()
+{
+  PORTB &= ~B00001010; // Set select outputs to 00
+  delayMicroseconds(SATURN_SELECT_PAUSE);
+  SaturnButtons[1] |= (PINF & 0xf0);
+}
+  
+// Read ST, A, C, B
+void SaturnRead2()
+{
+  PORTB ^= B00001010; // Toggle select outputs (01->10 or 10->01)
+  delayMicroseconds(SATURN_SELECT_PAUSE);
+  SaturnButtons[1] |= (PINF & 0xf0)>>4;
+}
+
+// Read DR, DL, DD, DU  
+void SaturnRead3()
+{
+  PORTB ^= B00000010; // Set select outputs to 10 from 11 (toggle)
+  delayMicroseconds(SATURN_SELECT_PAUSE);
+  SaturnButtons[0] |= (PINF & 0xf0) >> 4;
+}
+  
+// Read L, *, *, *
+void SaturnRead4()
+{
+  PORTB |= B00001010; // Set select outputs to 11
+  delayMicroseconds(SATURN_SELECT_PAUSE);
+  SaturnButtons[0] |= (PINF & 0xf0);
 }
 
 void sendLatch()

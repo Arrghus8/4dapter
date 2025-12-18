@@ -1,4 +1,34 @@
-# 4dapter - HID Firmware for MiSTer / PC
+# 4dapter - HID-Saturn Firmware for MiSTer / PC
+
+This alternative firmware replaces the Genesis input with a Sega Saturn input, based on the [DaemonBite-Retro-Controllers-USB/SaturnControllerUSB repository](https://github.com/MickGyver/DaemonBite-Retro-Controllers-USB/tree/master/SaturnControllerUSB).
+
+Wiring:
+```
+Contr. pin name     Contr. pin     Arduino Pin
+----------------------------------------------
+VCC                                 VCC ()
+GND                                 GND ()
+NES/SNES-LATCH          3           2   (PD1)
+NES/SNES-CLOCK          2           3   (PD0)
+NES-DATA                4           5   (PC6)
+NES-DATAD4              5           9   (PB5)
+NES-DATAD3              6           8   (PB4)
+SNES-DATA               4           7   (PE6)
+SNES-DATAD2             5           TX  (PD2)
+SNES-DATAD3             6           RX  (PD3)
+N64-3.3V                1           N/A
+N64-DATA                2           10  (PB6)
+N64-GND                 3           GND ()
+Saturn-VCC              1           VCC ()
+Saturn-DATA1            2           A2  (PF5)
+Saturn-DATA0            3           A3  (PF4)
+Saturn-SELECT0          4           15  (PB1)
+Saturn-SELECT1          5           14  (PB3)
+Saturn-TL               6           6   (PD7)
+Saturn-DATA3            7           A0  (PF7)
+Saturn-DATA2            8           A1  (PF6)
+Saturn-GND              9           GND ()
+```
 
 The default HID firmware will allow the 4dapter to appear a multiplayer input controller with 3 controller inputs acting as it's own separate player/input (NES and SNES are combined due to Arduino USB endpoint limitations.)
 
